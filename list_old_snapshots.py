@@ -443,8 +443,28 @@ def collect_old_snapshots_for_session(
             ami_snapshot_ids: Optional[Set[str]] = None
             need_ami_flag = (used_by_ami_filter != "all")
             populate_usedbyami_column = True
+            ami_lookup_available = False
             if need_ami_flag or populate_usedbyami_column:
-                ami_snapshot_ids = build_ami_snapshot_set(ec2)
+                try:
+                    ami_snapshot_ids = build_ami_snapshot_set(ec2)
+                    ami_lookup_available = True
+                except ClientError as e:
+                    err_code = str(e.response.get("Error", {}).get("Code", "")) if hasattr(e, "response") else ""
+                    if err_code in {"UnauthorizedOperation", "AccessDenied", "AccessDeniedException"}:
+                        if need_ami_flag:
+                            print(
+                                f"[warn] {account_id}: missing DescribeImages permission in {region}; skipping AMI usage filter.",
+                                file=sys.stderr,
+                            )
+                            continue
+                        else:
+                            print(
+                                f"[warn] {account_id}: missing DescribeImages permission in {region}; continuing without AMI usage column.",
+                                file=sys.stderr,
+                            )
+                            populate_usedbyami_column = False
+                    else:
+                        raise
 
             # Pricing per region (cached)
             prices = None
@@ -463,9 +483,13 @@ def collect_old_snapshots_for_session(
                 snap_id = snap.get("SnapshotId", "")
 
                 # AMI usage flag from prebuilt set
-                used_by_ami = False
-                if ami_snapshot_ids is not None and snap_id:
+                used_by_ami: Any
+                if ami_lookup_available and ami_snapshot_ids is not None and snap_id:
                     used_by_ami = snap_id in ami_snapshot_ids
+                elif populate_usedbyami_column:
+                    used_by_ami = False
+                else:
+                    used_by_ami = ""
 
                 if used_by_ami_filter == "only-unused" and used_by_ami:
                     continue
