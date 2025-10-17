@@ -28,6 +28,7 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, List, Dict, Any, Optional, Set, Tuple
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 from boto3.session import Session as BotoSession
@@ -81,6 +82,10 @@ def parse_args():
     p.add_argument("--csv", dest="csv_path", help="Optional CSV output path.")
     p.add_argument("--profile", help="AWS profile for the base session (optional in CloudShell).")
     p.add_argument("--verbose", action="store_true", help="Verbose logging (show per-account auth, identities, etc.).")
+    p.add_argument(
+        "--max-workers", type=int, default=None,
+        help="Maximum number of accounts to scan concurrently (default: min(32, number of target accounts)).",
+    )
 
     # Discovery / scoping
     p.add_argument("--org-all", action="store_true",
@@ -755,7 +760,18 @@ def main():
     all_rows: List[Dict[str, Any]] = []
     summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(lambda: {"count": 0, "total_gib": 0.0, "est_usd": 0.0})
 
-    for acct in target_accounts:
+    max_workers = args.max_workers
+    if max_workers is not None and max_workers < 1:
+        print(f"[warn] Invalid --max-workers value ({args.max_workers}); falling back to 1.", file=sys.stderr)
+        max_workers = 1
+    if max_workers is None:
+        max_workers = min(32, max(1, len(target_accounts)))
+
+    def process_account(acct: str):
+        local_summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(
+            lambda: {"count": 0, "total_gib": 0.0, "est_usd": 0.0}
+        )
+
         # Determine session by mode
         if acct == current_acct:
             use_sess = base_sess
@@ -766,54 +782,83 @@ def main():
             use_sess = session_from_sso_env(args.sso_env_path, acct, sess_region)
             if not use_sess:
                 print(f"[warn] Skipping account {acct} (sso_env failed).", file=sys.stderr)
-                continue
+                return acct, [], {}
             if args.verbose:
                 validate_session_identity(use_sess, acct, args.verbose)
         elif args.auth_mode == "assume-role":
             if not target_role_name:
                 print(f"[warn] No role to assume for {acct}; skipping.", file=sys.stderr)
-                continue
+                return acct, [], {}
             if args.verbose:
                 print(f"[info] {acct}: assuming role {target_role_name}")
             use_sess = assume_into_account(base_sess, acct, target_role_name)
             if use_sess is None:
                 print(f"[warn] Skipping account {acct} (assume role failed).", file=sys.stderr)
-                continue
+                return acct, [], {}
             if args.verbose:
                 validate_session_identity(use_sess, acct, args.verbose)
         else:  # auto
             use_sess = obtain_member_session_auto(base_sess, current_acct, acct, args, target_role_name)
             if not use_sess:
                 print(f"[warn] Skipping account {acct} (auto auth failed).", file=sys.stderr)
-                continue
+                return acct, [], {}
 
         regions = list_regions(use_sess, args.region)
         if not regions:
             print(f"[warn] {acct}: no regions discovered; skipping.", file=sys.stderr)
-            continue
+            return acct, [], {}
 
         rows = collect_old_snapshots_for_session(
-            use_sess, acct, regions, cutoff, cfg,
+            use_sess,
+            acct,
+            regions,
+            cutoff,
+            cfg,
             used_by_ami_filter=args.used_by_ami,
-            estimate_cost=args.estimate_cost, util_factor=max(0.0, min(1.0, args.util_factor))
+            estimate_cost=args.estimate_cost,
+            util_factor=max(0.0, min(1.0, args.util_factor)),
         )
 
         for r in rows:
             key = (r["AccountId"], r["Region"])
-            summary[key]["count"] += 1
+            local_summary[key]["count"] += 1
             try:
-                summary[key]["total_gib"] += float(r.get("VolumeSizeGiB") or 0.0)
+                local_summary[key]["total_gib"] += float(r.get("VolumeSizeGiB") or 0.0)
             except Exception:
                 pass
             try:
                 if args.estimate_cost and r.get("EstMonthlyUSD") not in ("", None):
-                    summary[key]["est_usd"] += float(r.get("EstMonthlyUSD") or 0.0)
+                    local_summary[key]["est_usd"] += float(r.get("EstMonthlyUSD") or 0.0)
             except Exception:
                 pass
 
         if args.verbose:
             print(f"[info] {acct}: found {len(rows)} old snapshots across {len(regions)} region(s).")
-        all_rows.extend(rows)
+
+        return acct, rows, local_summary
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_acct = {executor.submit(process_account, acct): acct for acct in target_accounts}
+        for future in as_completed(future_to_acct):
+            acct = future_to_acct[future]
+            try:
+                _, rows, acct_summary = future.result()
+            except Exception as e:
+                print(f"[error] {acct}: unhandled exception during snapshot collection: {e}", file=sys.stderr)
+                continue
+
+            all_rows.extend(rows)
+            for key, data in acct_summary.items():
+                summary[key]["count"] += data.get("count", 0)
+                try:
+                    summary[key]["total_gib"] += float(data.get("total_gib") or 0.0)
+                except Exception:
+                    pass
+                try:
+                    if args.estimate_cost and data.get("est_usd") not in ("", None):
+                        summary[key]["est_usd"] += float(data.get("est_usd") or 0.0)
+                except Exception:
+                    pass
 
     if not all_rows:
         print(f"No snapshots older than {args.days} days were found across {len(target_accounts)} account(s).")
