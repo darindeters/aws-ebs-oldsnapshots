@@ -17,6 +17,8 @@ This build:
 - OU scoping: --list-ous, --select-ou, --ou, --ou-recursive, --root.
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import sys
@@ -26,14 +28,37 @@ import os
 import re
 import subprocess
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, List, Dict, Any, Optional, Set, Tuple
+from typing import Iterable, List, Dict, Any, Optional, Set, Tuple, TYPE_CHECKING
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import boto3
-from boto3.session import Session as BotoSession
-from botocore.config import Config
-from botocore.exceptions import ClientError, EndpointConnectionError
+boto3: Any = None
+Config: Any = None
+ClientError: Any = None
+EndpointConnectionError: Any = None
+
+if TYPE_CHECKING:
+    from boto3.session import Session as BotoSession
+    from botocore.config import Config as BotoConfig
+else:  # pragma: no cover - typing aid only
+    BotoSession = Any  # type: ignore
+    BotoConfig = Any  # type: ignore
+
+
+def ensure_boto3_imported() -> None:
+    """Import boto3/botocore lazily so --help works without the dependency installed."""
+    global boto3, Config, ClientError, EndpointConnectionError
+    if boto3 is not None:
+        return
+
+    import boto3 as _boto3
+    from botocore.config import Config as _Config
+    from botocore.exceptions import ClientError as _ClientError, EndpointConnectionError as _EndpointConnectionError
+
+    boto3 = _boto3
+    Config = _Config
+    ClientError = _ClientError
+    EndpointConnectionError = _EndpointConnectionError
 
 # --------- Pricing fallbacks (USD/GB-month) ---------
 FALLBACK_PRICES = {"standard": 0.05, "archive": 0.0125}
@@ -174,6 +199,7 @@ def pick_session_region_for_sso_env(args, base_sess: BotoSession) -> str:
 # ---------------- SESSION / IDENTITY ----------------
 
 def get_base_session(profile: Optional[str] = None) -> BotoSession:
+    ensure_boto3_imported()
     return boto3.Session(profile_name=profile) if profile else boto3.Session()
 
 def get_current_account_and_role(sess: BotoSession) -> Tuple[str, Optional[str]]:
@@ -188,6 +214,7 @@ def get_current_account_and_role(sess: BotoSession) -> Tuple[str, Optional[str]]
     return account_id, role_name
 
 def assume_into_account(sess: BotoSession, account_id: str, role_name: str) -> Optional[BotoSession]:
+    ensure_boto3_imported()
     arn = f"arn:aws:iam::{account_id}:role/{role_name}"
     sts = sess.client("sts")
     try:
@@ -207,6 +234,7 @@ def session_from_sso_env(py_path: str, account_id: str, region: str) -> Optional
     Run: python sso_env.py <account_id> <region>
     Parse lines like 'export AWS_ACCESS_KEY_ID=...' and build a boto3.Session with those creds.
     """
+    ensure_boto3_imported()
     if not os.path.isabs(py_path):
         py_path = os.path.abspath(py_path)
     if not os.path.exists(py_path):
@@ -341,6 +369,7 @@ def list_all_org_accounts(sess: BotoSession) -> List[str]:
 # ------------------ EC2 / PRICING HELPERS ------------------
 
 def list_regions(sess: BotoSession, explicit_regions: List[str]) -> List[str]:
+    ensure_boto3_imported()
     expl = normalize_regions(explicit_regions)
     if expl:
         return expl
@@ -432,11 +461,12 @@ def collect_old_snapshots_for_session(
     account_id: str,
     regions: List[str],
     cutoff: datetime,
-    cfg: Config,
+    cfg: BotoConfig,
     used_by_ami_filter: str = "all",
     estimate_cost: bool = False,
     util_factor: float = 0.40
 ) -> List[Dict[str, Any]]:
+    ensure_boto3_imported()
     rows: List[Dict[str, Any]] = []
     regional_prices_cache: Dict[str, Dict[str, float]] = {}
 
@@ -634,6 +664,7 @@ def main():
     if args.sso_env and args.auth_mode == "auto":
         args.auth_mode = "sso-env"
 
+    ensure_boto3_imported()
     base_sess = get_base_session(args.profile)
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
 
