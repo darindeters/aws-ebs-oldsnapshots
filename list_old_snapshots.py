@@ -17,6 +17,8 @@ This build:
 - OU scoping: --list-ous, --select-ou, --ou, --ou-recursive, --root.
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import sys
@@ -26,13 +28,37 @@ import os
 import re
 import subprocess
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, List, Dict, Any, Optional, Set, Tuple
+from typing import Iterable, List, Dict, Any, Optional, Set, Tuple, TYPE_CHECKING
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import boto3
-from boto3.session import Session as BotoSession
-from botocore.config import Config
-from botocore.exceptions import ClientError, EndpointConnectionError
+boto3: Any = None
+Config: Any = None
+ClientError: Any = None
+EndpointConnectionError: Any = None
+
+if TYPE_CHECKING:
+    from boto3.session import Session as BotoSession
+    from botocore.config import Config as BotoConfig
+else:  # pragma: no cover - typing aid only
+    BotoSession = Any  # type: ignore
+    BotoConfig = Any  # type: ignore
+
+
+def ensure_boto3_imported() -> None:
+    """Import boto3/botocore lazily so --help works without the dependency installed."""
+    global boto3, Config, ClientError, EndpointConnectionError
+    if boto3 is not None:
+        return
+
+    import boto3 as _boto3
+    from botocore.config import Config as _Config
+    from botocore.exceptions import ClientError as _ClientError, EndpointConnectionError as _EndpointConnectionError
+
+    boto3 = _boto3
+    Config = _Config
+    ClientError = _ClientError
+    EndpointConnectionError = _EndpointConnectionError
 
 # --------- Pricing fallbacks (USD/GB-month) ---------
 FALLBACK_PRICES = {"standard": 0.05, "archive": 0.0125}
@@ -81,6 +107,10 @@ def parse_args():
     p.add_argument("--csv", dest="csv_path", help="Optional CSV output path.")
     p.add_argument("--profile", help="AWS profile for the base session (optional in CloudShell).")
     p.add_argument("--verbose", action="store_true", help="Verbose logging (show per-account auth, identities, etc.).")
+    p.add_argument(
+        "--max-workers", type=int, default=None,
+        help="Maximum number of accounts to scan concurrently (default: min(32, number of target accounts)).",
+    )
 
     # Discovery / scoping
     p.add_argument("--org-all", action="store_true",
@@ -169,6 +199,7 @@ def pick_session_region_for_sso_env(args, base_sess: BotoSession) -> str:
 # ---------------- SESSION / IDENTITY ----------------
 
 def get_base_session(profile: Optional[str] = None) -> BotoSession:
+    ensure_boto3_imported()
     return boto3.Session(profile_name=profile) if profile else boto3.Session()
 
 def get_current_account_and_role(sess: BotoSession) -> Tuple[str, Optional[str]]:
@@ -183,6 +214,7 @@ def get_current_account_and_role(sess: BotoSession) -> Tuple[str, Optional[str]]
     return account_id, role_name
 
 def assume_into_account(sess: BotoSession, account_id: str, role_name: str) -> Optional[BotoSession]:
+    ensure_boto3_imported()
     arn = f"arn:aws:iam::{account_id}:role/{role_name}"
     sts = sess.client("sts")
     try:
@@ -202,6 +234,7 @@ def session_from_sso_env(py_path: str, account_id: str, region: str) -> Optional
     Run: python sso_env.py <account_id> <region>
     Parse lines like 'export AWS_ACCESS_KEY_ID=...' and build a boto3.Session with those creds.
     """
+    ensure_boto3_imported()
     if not os.path.isabs(py_path):
         py_path = os.path.abspath(py_path)
     if not os.path.exists(py_path):
@@ -336,6 +369,7 @@ def list_all_org_accounts(sess: BotoSession) -> List[str]:
 # ------------------ EC2 / PRICING HELPERS ------------------
 
 def list_regions(sess: BotoSession, explicit_regions: List[str]) -> List[str]:
+    ensure_boto3_imported()
     expl = normalize_regions(explicit_regions)
     if expl:
         return expl
@@ -427,11 +461,12 @@ def collect_old_snapshots_for_session(
     account_id: str,
     regions: List[str],
     cutoff: datetime,
-    cfg: Config,
+    cfg: BotoConfig,
     used_by_ami_filter: str = "all",
     estimate_cost: bool = False,
     util_factor: float = 0.40
 ) -> List[Dict[str, Any]]:
+    ensure_boto3_imported()
     rows: List[Dict[str, Any]] = []
     regional_prices_cache: Dict[str, Dict[str, float]] = {}
 
@@ -629,6 +664,7 @@ def main():
     if args.sso_env and args.auth_mode == "auto":
         args.auth_mode = "sso-env"
 
+    ensure_boto3_imported()
     base_sess = get_base_session(args.profile)
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
 
@@ -755,7 +791,18 @@ def main():
     all_rows: List[Dict[str, Any]] = []
     summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(lambda: {"count": 0, "total_gib": 0.0, "est_usd": 0.0})
 
-    for acct in target_accounts:
+    max_workers = args.max_workers
+    if max_workers is not None and max_workers < 1:
+        print(f"[warn] Invalid --max-workers value ({args.max_workers}); falling back to 1.", file=sys.stderr)
+        max_workers = 1
+    if max_workers is None:
+        max_workers = min(32, max(1, len(target_accounts)))
+
+    def process_account(acct: str):
+        local_summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(
+            lambda: {"count": 0, "total_gib": 0.0, "est_usd": 0.0}
+        )
+
         # Determine session by mode
         if acct == current_acct:
             use_sess = base_sess
@@ -766,54 +813,83 @@ def main():
             use_sess = session_from_sso_env(args.sso_env_path, acct, sess_region)
             if not use_sess:
                 print(f"[warn] Skipping account {acct} (sso_env failed).", file=sys.stderr)
-                continue
+                return acct, [], {}
             if args.verbose:
                 validate_session_identity(use_sess, acct, args.verbose)
         elif args.auth_mode == "assume-role":
             if not target_role_name:
                 print(f"[warn] No role to assume for {acct}; skipping.", file=sys.stderr)
-                continue
+                return acct, [], {}
             if args.verbose:
                 print(f"[info] {acct}: assuming role {target_role_name}")
             use_sess = assume_into_account(base_sess, acct, target_role_name)
             if use_sess is None:
                 print(f"[warn] Skipping account {acct} (assume role failed).", file=sys.stderr)
-                continue
+                return acct, [], {}
             if args.verbose:
                 validate_session_identity(use_sess, acct, args.verbose)
         else:  # auto
             use_sess = obtain_member_session_auto(base_sess, current_acct, acct, args, target_role_name)
             if not use_sess:
                 print(f"[warn] Skipping account {acct} (auto auth failed).", file=sys.stderr)
-                continue
+                return acct, [], {}
 
         regions = list_regions(use_sess, args.region)
         if not regions:
             print(f"[warn] {acct}: no regions discovered; skipping.", file=sys.stderr)
-            continue
+            return acct, [], {}
 
         rows = collect_old_snapshots_for_session(
-            use_sess, acct, regions, cutoff, cfg,
+            use_sess,
+            acct,
+            regions,
+            cutoff,
+            cfg,
             used_by_ami_filter=args.used_by_ami,
-            estimate_cost=args.estimate_cost, util_factor=max(0.0, min(1.0, args.util_factor))
+            estimate_cost=args.estimate_cost,
+            util_factor=max(0.0, min(1.0, args.util_factor)),
         )
 
         for r in rows:
             key = (r["AccountId"], r["Region"])
-            summary[key]["count"] += 1
+            local_summary[key]["count"] += 1
             try:
-                summary[key]["total_gib"] += float(r.get("VolumeSizeGiB") or 0.0)
+                local_summary[key]["total_gib"] += float(r.get("VolumeSizeGiB") or 0.0)
             except Exception:
                 pass
             try:
                 if args.estimate_cost and r.get("EstMonthlyUSD") not in ("", None):
-                    summary[key]["est_usd"] += float(r.get("EstMonthlyUSD") or 0.0)
+                    local_summary[key]["est_usd"] += float(r.get("EstMonthlyUSD") or 0.0)
             except Exception:
                 pass
 
         if args.verbose:
             print(f"[info] {acct}: found {len(rows)} old snapshots across {len(regions)} region(s).")
-        all_rows.extend(rows)
+
+        return acct, rows, local_summary
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_acct = {executor.submit(process_account, acct): acct for acct in target_accounts}
+        for future in as_completed(future_to_acct):
+            acct = future_to_acct[future]
+            try:
+                _, rows, acct_summary = future.result()
+            except Exception as e:
+                print(f"[error] {acct}: unhandled exception during snapshot collection: {e}", file=sys.stderr)
+                continue
+
+            all_rows.extend(rows)
+            for key, data in acct_summary.items():
+                summary[key]["count"] += data.get("count", 0)
+                try:
+                    summary[key]["total_gib"] += float(data.get("total_gib") or 0.0)
+                except Exception:
+                    pass
+                try:
+                    if args.estimate_cost and data.get("est_usd") not in ("", None):
+                        summary[key]["est_usd"] += float(data.get("est_usd") or 0.0)
+                except Exception:
+                    pass
 
     if not all_rows:
         print(f"No snapshots older than {args.days} days were found across {len(target_accounts)} account(s).")
