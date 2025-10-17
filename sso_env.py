@@ -15,6 +15,10 @@ import sys
 import json
 import glob
 import time
+import hashlib
+import tempfile
+from datetime import datetime, timezone
+
 import boto3
 from botocore.exceptions import ClientError
 
@@ -65,6 +69,54 @@ def load_token_from_cache(start_url: str, sso_region: str):
         pass
     return None
 
+def _format_epoch(epoch: float) -> str:
+    return (
+        datetime.fromtimestamp(epoch, tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _cache_file_path(start_url: str) -> str:
+    cache_dir = os.path.expanduser("~/.aws/sso/cache")
+    digest = hashlib.sha1(start_url.encode("utf-8")).hexdigest()
+    return os.path.join(cache_dir, f"{digest}.json")
+
+
+def _write_sso_cache(start_url: str, sso_region: str, data: dict) -> None:
+    cache_dir = os.path.expanduser("~/.aws/sso/cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = _cache_file_path(start_url)
+
+    cache_payload = {
+        "startUrl": start_url,
+        "region": sso_region,
+        "accessToken": data["accessToken"],
+        "expiresAt": data["expiresAt"],
+    }
+
+    optional_fields = [
+        "refreshToken",
+        "clientId",
+        "clientSecret",
+        "registrationExpiresAt",
+    ]
+    for field in optional_fields:
+        value = data.get(field)
+        if value:
+            cache_payload[field] = value
+
+    with tempfile.NamedTemporaryFile("w", dir=cache_dir, delete=False) as tmp:
+        json.dump(cache_payload, tmp, indent=2)
+        tmp.write("\n")
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        os.chmod(tmp.name, 0o600)
+    os.replace(tmp.name, cache_path)
+    print(f"[info] Cached refreshed SSO token at {cache_path}")
+
+
 def device_auth_access_token(start_url: str, sso_region: str) -> str:
     """Run the device authorization flow to obtain a fresh Identity Center access token."""
     oidc = boto3.client("sso-oidc", region_name=sso_region)
@@ -72,6 +124,7 @@ def device_auth_access_token(start_url: str, sso_region: str) -> str:
     reg = oidc.register_client(clientName="sso-env.py", clientType="public")
     client_id = reg["clientId"]
     client_secret = reg.get("clientSecret")
+    registration_expires_at = reg.get("clientSecretExpiresAt")
 
     # Build kwargs without clientSecret if absent
     sda_kwargs = {"clientId": client_id, "startUrl": start_url}
@@ -101,6 +154,21 @@ def device_auth_access_token(start_url: str, sso_region: str) -> str:
             if client_secret:
                 ct_kwargs["clientSecret"] = client_secret
             tok = oidc.create_token(**ct_kwargs)
+
+            expires_at = _format_epoch(time.time() + tok.get("expiresIn", 0))
+            cache_data = {
+                "accessToken": tok["accessToken"],
+                "expiresAt": expires_at,
+            }
+            if tok.get("refreshToken"):
+                cache_data["refreshToken"] = tok["refreshToken"]
+            cache_data["clientId"] = client_id
+            if client_secret:
+                cache_data["clientSecret"] = client_secret
+            if registration_expires_at:
+                cache_data["registrationExpiresAt"] = _format_epoch(registration_expires_at)
+
+            _write_sso_cache(start_url, sso_region, cache_data)
             return tok["accessToken"]
         except oidc.exceptions.AuthorizationPendingException:
             time.sleep(interval)
