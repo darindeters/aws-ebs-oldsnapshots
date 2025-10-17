@@ -120,6 +120,8 @@ def parse_args():
     # Filters + cost estimate
     p.add_argument("--used-by-ami", choices=["all", "only-unused", "only-used"], default="all",
                    help="Filter snapshots by whether they back an AMI (default: all).")
+    p.add_argument("--min-size-gib", type=float, default=None,
+                   help="Minimum logical snapshot size (GiB) required to include the snapshot.")
     p.add_argument("--estimate-cost", action="store_true",
                    help="Estimate monthly $ for results and sum potential savings if deleted.")
     p.add_argument("--util-factor", type=float, default=0.40,
@@ -430,10 +432,12 @@ def collect_old_snapshots_for_session(
     cfg: Config,
     used_by_ami_filter: str = "all",
     estimate_cost: bool = False,
-    util_factor: float = 0.40
-) -> List[Dict[str, Any]]:
+    util_factor: float = 0.40,
+    min_size_gib: Optional[float] = None
+) -> Tuple[List[Dict[str, Any]], int]:
     rows: List[Dict[str, Any]] = []
     regional_prices_cache: Dict[str, Dict[str, float]] = {}
+    skipped_below_min: int = 0
 
     for region in regions:
         try:
@@ -501,6 +505,10 @@ def collect_old_snapshots_for_session(
                 # Prefer logical size from full bytes; fallback to VolumeSizeGiB
                 logical_gib = (float(full_bytes) / BYTES_PER_GIB) if isinstance(full_bytes, (int, float)) else vol_size_gib
 
+                if min_size_gib is not None and logical_gib < min_size_gib:
+                    skipped_below_min += 1
+                    continue
+
                 tier = str(snap.get("StorageTier") or "standard").lower()
                 if tier not in ("standard", "archive"):
                     tier = "standard"
@@ -554,7 +562,7 @@ def collect_old_snapshots_for_session(
             print(f"[skip] {account_id}: region not reachable: {region}", file=sys.stderr)
         except ClientError as e:
             print(f"[warn] {account_id}: error in region {region}: {e}", file=sys.stderr)
-    return rows
+    return rows, skipped_below_min
 
 # ------------------ INTERACTIVE PICKER ------------------
 
@@ -754,6 +762,7 @@ def main():
     # Collect + summaries
     all_rows: List[Dict[str, Any]] = []
     summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(lambda: {"count": 0, "total_gib": 0.0, "est_usd": 0.0})
+    total_skipped_below_min = 0
 
     for acct in target_accounts:
         # Determine session by mode
@@ -792,11 +801,15 @@ def main():
             print(f"[warn] {acct}: no regions discovered; skipping.", file=sys.stderr)
             continue
 
-        rows = collect_old_snapshots_for_session(
+        rows, skipped_below_min = collect_old_snapshots_for_session(
             use_sess, acct, regions, cutoff, cfg,
             used_by_ami_filter=args.used_by_ami,
-            estimate_cost=args.estimate_cost, util_factor=max(0.0, min(1.0, args.util_factor))
+            estimate_cost=args.estimate_cost,
+            util_factor=max(0.0, min(1.0, args.util_factor)),
+            min_size_gib=args.min_size_gib
         )
+
+        total_skipped_below_min += skipped_below_min
 
         for r in rows:
             key = (r["AccountId"], r["Region"])
@@ -812,11 +825,19 @@ def main():
                 pass
 
         if args.verbose:
-            print(f"[info] {acct}: found {len(rows)} old snapshots across {len(regions)} region(s).")
+            info_msg = f"[info] {acct}: found {len(rows)} old snapshots across {len(regions)} region(s)."
+            if args.min_size_gib is not None and skipped_below_min:
+                info_msg += f" (excluded {skipped_below_min} < {args.min_size_gib} GiB)"
+            print(info_msg)
         all_rows.extend(rows)
 
     if not all_rows:
         print(f"No snapshots older than {args.days} days were found across {len(target_accounts)} account(s).")
+        if args.min_size_gib is not None:
+            if total_skipped_below_min:
+                print(f"Excluded {total_skipped_below_min} snapshot(s) smaller than {args.min_size_gib} GiB.")
+            else:
+                print(f"No snapshots were excluded by the {args.min_size_gib} GiB minimum size filter.")
         return
 
     if args.summary_only:
@@ -833,6 +854,12 @@ def main():
             print(f"\nGlobal total: {int(grand_count)} snaps | {grand_gib:.2f} GiB | ${grand_usd:.2f}/mo (est.)")
         else:
             print(f"\nGlobal total: {int(grand_count)} snaps | {grand_gib:.2f} GiB")
+
+        if args.min_size_gib is not None:
+            if total_skipped_below_min:
+                print(f"Excluded {total_skipped_below_min} snapshot(s) smaller than {args.min_size_gib} GiB.")
+            else:
+                print(f"No snapshots were excluded by the {args.min_size_gib} GiB minimum size filter.")
 
         if args.csv_path:
             try:
@@ -889,6 +916,12 @@ def main():
             print(f"Wrote CSV: {args.csv_path}")
         except OSError as e:
             print(f"Failed to write CSV: {e}", file=sys.stderr)
+
+    if args.min_size_gib is not None:
+        if total_skipped_below_min:
+            print(f"Excluded {total_skipped_below_min} snapshot(s) smaller than {args.min_size_gib} GiB.")
+        else:
+            print(f"No snapshots were excluded by the {args.min_size_gib} GiB minimum size filter.")
 
 if __name__ == "__main__":
     try:
