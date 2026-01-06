@@ -71,6 +71,8 @@ Typical use cases include:
 | `--used-by-ami` | Filter based on AMI usage (`all`, `only-unused`, `only-used`). |
 | `--estimate-cost` | Enable storage cost calculations for the reported snapshots. |
 | `--util-factor` | Utilization factor (0-1) used when snapshots lack `FullSnapshotSizeInBytes` metadata (default: `0.40`). |
+| `--min-size-gib` / `--max-size-gib` | Filter out snapshots outside a logical size range (GiB) based on `FullSnapshotSizeInBytes` when available. |
+| `--check-sharing` | Inspect snapshot sharing (CreateVolumePermissions) to flag public or cross-account access. |
 
 Run `python list_old_snapshots.py --help` to view all supported options.
 
@@ -116,6 +118,7 @@ account_id,region,snapshot_id,age_days,size_gib,used_by_ami,storage_tier,estimat
 * Use `--dry-run --verbose` to confirm account discovery and authentication before running the full audit.
 * Pair `--summary-only` with `--estimate-cost` to get a quick financial view without detailed rows.
 * The tool automatically deduplicates regions and warns about invalid region tokens.
+* `--check-sharing` performs an extra `DescribeSnapshotAttribute` call per snapshot to flag public or cross-account sharing; the CSV gains `ShareStatus` and `SharedWith` columns when enabled.
 
 ## `sso_env.py`
 
@@ -176,4 +179,3 @@ To authorize this session, open the following URL and, if asked, enter the code:
 * Keep `boto3` and `botocore` up to date to pick up API improvements.
 * Contributions are welcome—open pull requests with a clear description of the enhancements or fixes. Please include manual testing notes or sample command outputs to demonstrate the change.
 * For larger feature additions, consider adding docstrings or inline comments in the scripts to maintain clarity.
-
