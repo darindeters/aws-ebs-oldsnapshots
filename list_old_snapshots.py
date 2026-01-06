@@ -154,6 +154,12 @@ def parse_args():
                    help="Estimate monthly $ for results and sum potential savings if deleted.")
     p.add_argument("--util-factor", type=float, default=0.40,
                    help="Estimated billed GiB fraction of *logical* size (0-1). Used only when FullSnapshotSizeInBytes is missing.")
+    p.add_argument("--min-size-gib", type=float, default=None,
+                   help="Filter snapshots smaller than this logical size (GiB) out of the results.")
+    p.add_argument("--max-size-gib", type=float, default=None,
+                   help="Filter snapshots larger than this logical size (GiB) out of the results.")
+    p.add_argument("--check-sharing", action="store_true",
+                   help="Inspect CreateVolumePermissions to flag public or cross-account sharing (additional API calls).")
 
     return p.parse_args()
 
@@ -464,7 +470,10 @@ def collect_old_snapshots_for_session(
     cfg: BotoConfig,
     used_by_ami_filter: str = "all",
     estimate_cost: bool = False,
-    util_factor: float = 0.40
+    util_factor: float = 0.40,
+    min_size_gib: Optional[float] = None,
+    max_size_gib: Optional[float] = None,
+    check_sharing: bool = False,
 ) -> List[Dict[str, Any]]:
     ensure_boto3_imported()
     rows: List[Dict[str, Any]] = []
@@ -536,9 +545,34 @@ def collect_old_snapshots_for_session(
                 # Prefer logical size from full bytes; fallback to VolumeSizeGiB
                 logical_gib = (float(full_bytes) / BYTES_PER_GIB) if isinstance(full_bytes, (int, float)) else vol_size_gib
 
+                if min_size_gib is not None and logical_gib < float(min_size_gib):
+                    continue
+                if max_size_gib is not None and logical_gib > float(max_size_gib):
+                    continue
+
                 tier = str(snap.get("StorageTier") or "standard").lower()
                 if tier not in ("standard", "archive"):
                     tier = "standard"
+
+                share_status = "private"
+                shared_with = ""
+                if check_sharing and snap_id:
+                    try:
+                        attr = ec2.describe_snapshot_attribute(
+                            SnapshotId=snap_id, Attribute="createVolumePermission"
+                        )
+                        perms = attr.get("CreateVolumePermissions", [])
+                        accounts = sorted({p.get("UserId") for p in perms if p.get("UserId")})
+                        is_public = any(p.get("Group") == "all" for p in perms)
+                        if is_public:
+                            share_status = "public"
+                        elif accounts:
+                            share_status = "shared"
+                            shared_with = ",".join(accounts)
+                    except ClientError as e:
+                        code = str(e.response.get("Error", {}).get("Code", "")) if hasattr(e, "response") else ""
+                        share_status = "error"
+                        shared_with = code or "UnknownError"
 
                 # --- Cost estimation ---
                 est_monthly_usd = ""
@@ -570,6 +604,7 @@ def collect_old_snapshots_for_session(
                     "AgeDays": int((datetime.now(timezone.utc) - start).days),
                     "State": snap.get("State", ""),
                     "VolumeSizeGiB": int(vol_size_gib),
+                    "LogicalSizeGiB": round(logical_gib, 2),
                     "FullSnapshotSizeInBytes": full_bytes if full_bytes is not None else "",
                     "Encrypted": snap.get("Encrypted", False),
                     "KmsKeyId": snap.get("KmsKeyId", ""),
@@ -578,6 +613,8 @@ def collect_old_snapshots_for_session(
                     "OwnerId": snap.get("OwnerId", ""),
                     "StorageTier": tier,
                     "Progress": snap.get("Progress", ""),
+                    "ShareStatus": share_status,
+                    "SharedWith": shared_with,
                     "UsedByAMI": used_by_ami,
                     # Cost fields
                     "UtilFactor": util_applied,            # "" when not applied
@@ -736,6 +773,16 @@ def main():
         target_accounts = [a for a in target_accounts if a not in ex]
     target_accounts = sorted(list(set(target_accounts)))
 
+    if args.min_size_gib is not None and args.min_size_gib < 0:
+        print(f"[warn] Ignoring negative --min-size-gib ({args.min_size_gib}); using 0.0 instead.", file=sys.stderr)
+        args.min_size_gib = 0.0
+    if args.max_size_gib is not None and args.max_size_gib < 0:
+        print(f"[warn] Ignoring negative --max-size-gib ({args.max_size_gib}); disabling max filter.", file=sys.stderr)
+        args.max_size_gib = None
+    if args.min_size_gib is not None and args.max_size_gib is not None and args.min_size_gib > args.max_size_gib:
+        print(f"[warn] --min-size-gib ({args.min_size_gib}) is greater than --max-size-gib ({args.max_size_gib}); swapping values.", file=sys.stderr)
+        args.min_size_gib, args.max_size_gib = args.max_size_gib, args.min_size_gib
+
     # DRY RUN
     if args.dry_run:
         print("\n=== DRY RUN PREVIEW ===")
@@ -848,6 +895,9 @@ def main():
             used_by_ami_filter=args.used_by_ami,
             estimate_cost=args.estimate_cost,
             util_factor=max(0.0, min(1.0, args.util_factor)),
+            min_size_gib=args.min_size_gib,
+            max_size_gib=args.max_size_gib,
+            check_sharing=args.check_sharing,
         )
 
         for r in rows:
@@ -928,7 +978,8 @@ def main():
 
     # Detailed preview (first 80 rows)
     header = ["AccountId","Region","SnapshotId","VolumeId","StartTime","AgeDays",
-              "VolumeSizeGiB","FullSnapshotSizeInBytes","State","Encrypted","StorageTier","UsedByAMI","Description"]
+              "VolumeSizeGiB","LogicalSizeGiB","FullSnapshotSizeInBytes","State","Encrypted","StorageTier",
+              "ShareStatus","SharedWith","UsedByAMI","Description"]
     if args.estimate_cost:
         header.extend(["UtilFactor","PriceUSDperGBMo","EstBilledGiB","EstMonthlyUSD"])
     print("\n=== Old EBS Snapshots ===")
@@ -942,7 +993,8 @@ def main():
             desc = desc[:57] + "..."
         vals = [str(r.get(k, "")) for k in [
             "AccountId","Region","SnapshotId","VolumeId","StartTime","AgeDays",
-            "VolumeSizeGiB","FullSnapshotSizeInBytes","State","Encrypted","StorageTier","UsedByAMI"
+            "VolumeSizeGiB","LogicalSizeGiB","FullSnapshotSizeInBytes","State","Encrypted","StorageTier",
+            "ShareStatus","SharedWith","UsedByAMI"
         ]]
         vals.append(desc)
         if args.estimate_cost:
@@ -955,8 +1007,8 @@ def main():
 
     if args.csv_path:
         fieldnames = ["AccountId","Region","SnapshotId","VolumeId","StartTime","AgeDays",
-                      "State","VolumeSizeGiB","FullSnapshotSizeInBytes","Encrypted","KmsKeyId","Description","Tags",
-                      "OwnerId","StorageTier","Progress","UsedByAMI",
+                      "State","VolumeSizeGiB","LogicalSizeGiB","FullSnapshotSizeInBytes","Encrypted","KmsKeyId","Description","Tags",
+                      "OwnerId","StorageTier","Progress","ShareStatus","SharedWith","UsedByAMI",
                       "UtilFactor","PriceUSDperGBMo","EstBilledGiB","EstMonthlyUSD"]
         try:
             with open(args.csv_path, "w", newline="", encoding="utf-8") as f:
