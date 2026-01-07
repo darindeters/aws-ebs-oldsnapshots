@@ -146,6 +146,10 @@ def parse_args():
                    help="Preview target accounts/regions; no DescribeSnapshots.")
     p.add_argument("--summary-only", action="store_true",
                    help="Print a per-account/region summary (count, total GiB) and suppress row output.")
+    p.add_argument("--orphan-volumes", action="store_true",
+                   help="Also track unattached (available) EBS volumes per account/region.")
+    p.add_argument("--orphan-volumes-csv",
+                   help="Optional CSV output path for orphaned EBS volume details.")
 
     # Filters + cost estimate
     p.add_argument("--used-by-ami", choices=["all", "only-unused", "only-used"], default="all",
@@ -419,6 +423,15 @@ def build_ami_snapshot_set(ec2_client) -> Set[str]:
             break
     return used
 
+def paginate_orphan_volumes(ec2_client) -> Iterable[Dict[str, Any]]:
+    paginator = ec2_client.get_paginator("describe_volumes")
+    for page in paginator.paginate(
+        Filters=[{"Name": "status", "Values": ["available"]}],
+        PaginationConfig={"PageSize": 500},
+    ):
+        for vol in page.get("Volumes", []):
+            yield vol
+
 def _pricing_lookup(pricing_client, location_text: str, usagetype_substring: str) -> Optional[float]:
     try:
         resp = pricing_client.get_products(
@@ -626,6 +639,49 @@ def collect_old_snapshots_for_session(
             print(f"[skip] {account_id}: region not reachable: {region}", file=sys.stderr)
         except ClientError as e:
             print(f"[warn] {account_id}: error in region {region}: {e}", file=sys.stderr)
+    return rows
+
+def collect_orphan_volumes_for_session(
+    sess: BotoSession,
+    account_id: str,
+    regions: List[str],
+    cfg: BotoConfig,
+) -> List[Dict[str, Any]]:
+    ensure_boto3_imported()
+    rows: List[Dict[str, Any]] = []
+
+    for region in regions:
+        try:
+            ec2 = sess.client("ec2", region_name=region, config=cfg)
+            for vol in paginate_orphan_volumes(ec2):
+                create_time = vol.get("CreateTime")
+                if isinstance(create_time, datetime):
+                    create_time_str = create_time.isoformat()
+                    age_days = int((datetime.now(timezone.utc) - create_time).days)
+                else:
+                    create_time_str = ""
+                    age_days = ""
+
+                rows.append({
+                    "AccountId": account_id,
+                    "Region": region,
+                    "VolumeId": vol.get("VolumeId", ""),
+                    "State": vol.get("State", ""),
+                    "SizeGiB": int(vol.get("Size", 0) or 0),
+                    "VolumeType": vol.get("VolumeType", ""),
+                    "Iops": vol.get("Iops", ""),
+                    "Throughput": vol.get("Throughput", ""),
+                    "Encrypted": vol.get("Encrypted", False),
+                    "KmsKeyId": vol.get("KmsKeyId", ""),
+                    "SnapshotId": vol.get("SnapshotId", ""),
+                    "CreateTime": create_time_str,
+                    "AgeDays": age_days,
+                    "Tags": ";".join([f"{t.get('Key')}={t.get('Value')}" for t in (vol.get("Tags") or [])]),
+                })
+        except EndpointConnectionError:
+            print(f"[skip] {account_id}: region not reachable: {region}", file=sys.stderr)
+        except ClientError as e:
+            print(f"[warn] {account_id}: error listing volumes in region {region}: {e}", file=sys.stderr)
     return rows
 
 # ------------------ INTERACTIVE PICKER ------------------
@@ -836,7 +892,9 @@ def main():
 
     # Collect + summaries
     all_rows: List[Dict[str, Any]] = []
+    all_orphan_rows: List[Dict[str, Any]] = []
     summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(lambda: {"count": 0, "total_gib": 0.0, "est_usd": 0.0})
+    orphan_summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(lambda: {"count": 0, "total_gib": 0.0})
 
     max_workers = args.max_workers
     if max_workers is not None and max_workers < 1:
@@ -849,6 +907,9 @@ def main():
         local_summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(
             lambda: {"count": 0, "total_gib": 0.0, "est_usd": 0.0}
         )
+        local_orphan_summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(
+            lambda: {"count": 0, "total_gib": 0.0}
+        )
 
         # Determine session by mode
         if acct == current_acct:
@@ -860,31 +921,31 @@ def main():
             use_sess = session_from_sso_env(args.sso_env_path, acct, sess_region)
             if not use_sess:
                 print(f"[warn] Skipping account {acct} (sso_env failed).", file=sys.stderr)
-                return acct, [], {}
+                return acct, [], {}, [], {}
             if args.verbose:
                 validate_session_identity(use_sess, acct, args.verbose)
         elif args.auth_mode == "assume-role":
             if not target_role_name:
                 print(f"[warn] No role to assume for {acct}; skipping.", file=sys.stderr)
-                return acct, [], {}
+                return acct, [], {}, [], {}
             if args.verbose:
                 print(f"[info] {acct}: assuming role {target_role_name}")
             use_sess = assume_into_account(base_sess, acct, target_role_name)
             if use_sess is None:
                 print(f"[warn] Skipping account {acct} (assume role failed).", file=sys.stderr)
-                return acct, [], {}
+                return acct, [], {}, [], {}
             if args.verbose:
                 validate_session_identity(use_sess, acct, args.verbose)
         else:  # auto
             use_sess = obtain_member_session_auto(base_sess, current_acct, acct, args, target_role_name)
             if not use_sess:
                 print(f"[warn] Skipping account {acct} (auto auth failed).", file=sys.stderr)
-                return acct, [], {}
+                return acct, [], {}, [], {}
 
         regions = list_regions(use_sess, args.region)
         if not regions:
             print(f"[warn] {acct}: no regions discovered; skipping.", file=sys.stderr)
-            return acct, [], {}
+            return acct, [], {}, [], {}
 
         rows = collect_old_snapshots_for_session(
             use_sess,
@@ -899,6 +960,14 @@ def main():
             max_size_gib=args.max_size_gib,
             check_sharing=args.check_sharing,
         )
+        orphan_rows: List[Dict[str, Any]] = []
+        if args.orphan_volumes:
+            orphan_rows = collect_orphan_volumes_for_session(
+                use_sess,
+                acct,
+                regions,
+                cfg,
+            )
 
         for r in rows:
             key = (r["AccountId"], r["Region"])
@@ -913,22 +982,34 @@ def main():
             except Exception:
                 pass
 
+        for r in orphan_rows:
+            key = (r["AccountId"], r["Region"])
+            local_orphan_summary[key]["count"] += 1
+            try:
+                local_orphan_summary[key]["total_gib"] += float(r.get("SizeGiB") or 0.0)
+            except Exception:
+                pass
+
         if args.verbose:
             print(f"[info] {acct}: found {len(rows)} old snapshots across {len(regions)} region(s).")
 
-        return acct, rows, local_summary
+        if args.orphan_volumes and args.verbose:
+            print(f"[info] {acct}: found {len(orphan_rows)} orphaned volumes across {len(regions)} region(s).")
+
+        return acct, rows, local_summary, orphan_rows, local_orphan_summary
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_acct = {executor.submit(process_account, acct): acct for acct in target_accounts}
         for future in as_completed(future_to_acct):
             acct = future_to_acct[future]
             try:
-                _, rows, acct_summary = future.result()
+                _, rows, acct_summary, orphan_rows, acct_orphan_summary = future.result()
             except Exception as e:
                 print(f"[error] {acct}: unhandled exception during snapshot collection: {e}", file=sys.stderr)
                 continue
 
             all_rows.extend(rows)
+            all_orphan_rows.extend(orphan_rows)
             for key, data in acct_summary.items():
                 summary[key]["count"] += data.get("count", 0)
                 try:
@@ -940,9 +1021,17 @@ def main():
                         summary[key]["est_usd"] += float(data.get("est_usd") or 0.0)
                 except Exception:
                     pass
+            for key, data in acct_orphan_summary.items():
+                orphan_summary[key]["count"] += data.get("count", 0)
+                try:
+                    orphan_summary[key]["total_gib"] += float(data.get("total_gib") or 0.0)
+                except Exception:
+                    pass
 
-    if not all_rows:
+    if not all_rows and not all_orphan_rows:
         print(f"No snapshots older than {args.days} days were found across {len(target_accounts)} account(s).")
+        if args.orphan_volumes:
+            print("No orphaned EBS volumes were found.")
         return
 
     if args.summary_only:
@@ -960,6 +1049,15 @@ def main():
         else:
             print(f"\nGlobal total: {int(grand_count)} snaps | {grand_gib:.2f} GiB")
 
+        if args.orphan_volumes:
+            print("\n=== ORPHANED EBS VOLUMES SUMMARY ===")
+            orphan_total = 0; orphan_gib = 0.0
+            for (acct, region) in sorted(orphan_summary.keys()):
+                data = orphan_summary[(acct, region)]
+                orphan_total += data["count"]; orphan_gib += data["total_gib"]
+                print(f"  {acct} | {region:>12} | {int(data['count']):>5} vols | {data['total_gib']:.2f} GiB")
+            print(f"\nGlobal total: {int(orphan_total)} vols | {orphan_gib:.2f} GiB")
+
         if args.csv_path:
             try:
                 with open(args.csv_path, "w", newline="", encoding="utf-8") as f:
@@ -974,38 +1072,72 @@ def main():
                 print(f"Wrote summary CSV: {args.csv_path}")
             except OSError as e:
                 print(f"Failed to write summary CSV: {e}", file=sys.stderr)
+
+        if args.orphan_volumes_csv and args.orphan_volumes:
+            try:
+                with open(args.orphan_volumes_csv, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    hdr = ["AccountId","Region","OrphanVolumeCount","TotalVolumeSizeGiB"]
+                    writer.writerow(hdr)
+                    for (acct, region), data in sorted(orphan_summary.items()):
+                        row = [acct, region, int(data["count"]), f"{data['total_gib']:.2f}"]
+                        writer.writerow(row)
+                print(f"Wrote orphan volumes summary CSV: {args.orphan_volumes_csv}")
+            except OSError as e:
+                print(f"Failed to write orphan volumes summary CSV: {e}", file=sys.stderr)
         return
 
-    # Detailed preview (first 80 rows)
-    header = ["AccountId","Region","SnapshotId","VolumeId","StartTime","AgeDays",
-              "VolumeSizeGiB","LogicalSizeGiB","FullSnapshotSizeInBytes","State","Encrypted","StorageTier",
-              "ShareStatus","SharedWith","UsedByAMI","Description"]
-    if args.estimate_cost:
-        header.extend(["UtilFactor","PriceUSDperGBMo","EstBilledGiB","EstMonthlyUSD"])
-    print("\n=== Old EBS Snapshots ===")
-    print("\t".join(header))
-    shown = 0
-    for r in all_rows:
-        if shown >= 80:
-            break
-        desc = r.get("Description", "")
-        if len(desc) > 60:
-            desc = desc[:57] + "..."
-        vals = [str(r.get(k, "")) for k in [
-            "AccountId","Region","SnapshotId","VolumeId","StartTime","AgeDays",
-            "VolumeSizeGiB","LogicalSizeGiB","FullSnapshotSizeInBytes","State","Encrypted","StorageTier",
-            "ShareStatus","SharedWith","UsedByAMI"
-        ]]
-        vals.append(desc)
+    if all_rows:
+        # Detailed preview (first 80 rows)
+        header = ["AccountId","Region","SnapshotId","VolumeId","StartTime","AgeDays",
+                  "VolumeSizeGiB","LogicalSizeGiB","FullSnapshotSizeInBytes","State","Encrypted","StorageTier",
+                  "ShareStatus","SharedWith","UsedByAMI","Description"]
         if args.estimate_cost:
-            vals.extend([str(r.get("UtilFactor","")), str(r.get("PriceUSDperGBMo","")),
-                         str(r.get("EstBilledGiB","")), str(r.get("EstMonthlyUSD",""))])
-        print("\t".join(vals))
-        shown += 1
-    if len(all_rows) > shown:
-        print(f"... ({len(all_rows) - shown} more)")
+            header.extend(["UtilFactor","PriceUSDperGBMo","EstBilledGiB","EstMonthlyUSD"])
+        print("\n=== Old EBS Snapshots ===")
+        print("\t".join(header))
+        shown = 0
+        for r in all_rows:
+            if shown >= 80:
+                break
+            desc = r.get("Description", "")
+            if len(desc) > 60:
+                desc = desc[:57] + "..."
+            vals = [str(r.get(k, "")) for k in [
+                "AccountId","Region","SnapshotId","VolumeId","StartTime","AgeDays",
+                "VolumeSizeGiB","LogicalSizeGiB","FullSnapshotSizeInBytes","State","Encrypted","StorageTier",
+                "ShareStatus","SharedWith","UsedByAMI"
+            ]]
+            vals.append(desc)
+            if args.estimate_cost:
+                vals.extend([str(r.get("UtilFactor","")), str(r.get("PriceUSDperGBMo","")),
+                             str(r.get("EstBilledGiB","")), str(r.get("EstMonthlyUSD",""))])
+            print("\t".join(vals))
+            shown += 1
+        if len(all_rows) > shown:
+            print(f"... ({len(all_rows) - shown} more)")
+    else:
+        print(f"No snapshots older than {args.days} days were found across {len(target_accounts)} account(s).")
 
-    if args.csv_path:
+    if args.orphan_volumes:
+        if all_orphan_rows:
+            header = ["AccountId","Region","VolumeId","State","SizeGiB","VolumeType","Iops","Throughput",
+                      "Encrypted","KmsKeyId","SnapshotId","CreateTime","AgeDays","Tags"]
+            print("\n=== Orphaned EBS Volumes ===")
+            print("\t".join(header))
+            shown = 0
+            for r in all_orphan_rows:
+                if shown >= 80:
+                    break
+                vals = [str(r.get(k, "")) for k in header]
+                print("\t".join(vals))
+                shown += 1
+            if len(all_orphan_rows) > shown:
+                print(f"... ({len(all_orphan_rows) - shown} more)")
+        else:
+            print("No orphaned EBS volumes were found.")
+
+    if args.csv_path and all_rows:
         fieldnames = ["AccountId","Region","SnapshotId","VolumeId","StartTime","AgeDays",
                       "State","VolumeSizeGiB","LogicalSizeGiB","FullSnapshotSizeInBytes","Encrypted","KmsKeyId","Description","Tags",
                       "OwnerId","StorageTier","Progress","ShareStatus","SharedWith","UsedByAMI",
@@ -1017,6 +1149,17 @@ def main():
             print(f"Wrote CSV: {args.csv_path}")
         except OSError as e:
             print(f"Failed to write CSV: {e}", file=sys.stderr)
+
+    if args.orphan_volumes and args.orphan_volumes_csv and all_orphan_rows:
+        fieldnames = ["AccountId","Region","VolumeId","State","SizeGiB","VolumeType","Iops","Throughput",
+                      "Encrypted","KmsKeyId","SnapshotId","CreateTime","AgeDays","Tags"]
+        try:
+            with open(args.orphan_volumes_csv, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader(); w.writerows(all_orphan_rows)
+            print(f"Wrote orphan volumes CSV: {args.orphan_volumes_csv}")
+        except OSError as e:
+            print(f"Failed to write orphan volumes CSV: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     try:

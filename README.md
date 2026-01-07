@@ -68,6 +68,8 @@ Typical use cases include:
 | `--sso-env-path` | Path to the Identity Center helper (default: `./sso_env.py`). |
 | `--dry-run` | Preview targeted accounts/regions without calling `DescribeSnapshots`. |
 | `--summary-only` | Print a concise per-account/per-region summary while suppressing snapshot row output. |
+| `--orphan-volumes` | Also track unattached (available) EBS volumes per account/region. |
+| `--orphan-volumes-csv PATH` | Write orphaned EBS volume details (or summaries with `--summary-only`) to the provided CSV file path. |
 | `--used-by-ami` | Filter based on AMI usage (`all`, `only-unused`, `only-used`). |
 | `--estimate-cost` | Enable storage cost calculations for the reported snapshots. |
 | `--util-factor` | Utilization factor (0-1) used when snapshots lack `FullSnapshotSizeInBytes` metadata (default: `0.40`). |
@@ -111,6 +113,24 @@ Sample CSV rows:
 account_id,region,snapshot_id,age_days,size_gib,used_by_ami,storage_tier,estimated_monthly_usd
 123456789012,us-east-1,snap-0abc123,427,75.0,unused,standard,3.75
 123456789012,us-west-2,snap-09def456,312,15.0,used,archive,0.19
+```
+
+### Example: orphaned volume tracking
+
+```bash
+python list_old_snapshots.py \
+  --org-all \
+  --assume-role-name AuditRole \
+  --region us-east-1 \
+  --orphan-volumes \
+  --orphan-volumes-csv reports/orphaned-volumes.csv
+```
+
+Sample orphaned volume CSV rows:
+
+```csv
+AccountId,Region,VolumeId,State,SizeGiB,VolumeType,Iops,Throughput,Encrypted,KmsKeyId,SnapshotId,CreateTime,AgeDays,Tags
+123456789012,us-east-1,vol-0123456789abcdef0,available,100,gp3,3000,125,True,arn:aws:kms:...,snap-0abc123,2024-02-14T01:22:33+00:00,209,Environment=dev
 ```
 
 ### Additional tips
