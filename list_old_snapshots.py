@@ -62,6 +62,15 @@ def ensure_boto3_imported() -> None:
 
 # --------- Pricing fallbacks (USD/GB-month) ---------
 FALLBACK_PRICES = {"standard": 0.05, "archive": 0.0125}
+FALLBACK_VOLUME_PRICES = {
+    "standard": 0.05,  # magnetic
+    "gp2": 0.10,
+    "gp3": 0.08,
+    "io1": 0.125,
+    "io2": 0.125,
+    "st1": 0.045,
+    "sc1": 0.015,
+}
 
 # --------- Region code -> AWS Pricing "location" text ---------
 AWS_LOCATION_NAME = {
@@ -456,6 +465,30 @@ def _pricing_lookup(pricing_client, location_text: str, usagetype_substring: str
         pass
     return None
 
+def _pricing_lookup_volume(pricing_client, location_text: str, volume_api_name: str) -> Optional[float]:
+    try:
+        resp = pricing_client.get_products(
+            ServiceCode="AmazonEC2",
+            Filters=[
+                {"Type": "TERM_MATCH", "Field": "productFamily", "Value": "Storage"},
+                {"Type": "TERM_MATCH", "Field": "location", "Value": location_text},
+                {"Type": "TERM_MATCH", "Field": "volumeApiName", "Value": volume_api_name},
+            ],
+            MaxResults=100,
+        )
+        for item in resp.get("PriceList", []):
+            data = json.loads(item)
+            terms = data.get("terms", {}).get("OnDemand", {})
+            for _k, term in terms.items():
+                for _dk, dim in term.get("priceDimensions", {}).items():
+                    if dim.get("unit") == "GB-Mo":
+                        usd = dim.get("pricePerUnit", {}).get("USD")
+                        if usd:
+                            return float(usd)
+    except Exception:
+        pass
+    return None
+
 def get_snapshot_prices(sess: BotoSession, region_name: str) -> Dict[str, float]:
     prices = {"standard": FALLBACK_PRICES["standard"], "archive": FALLBACK_PRICES["archive"]}
     try:
@@ -473,6 +506,20 @@ def get_snapshot_prices(sess: BotoSession, region_name: str) -> Dict[str, float]
         pass
     return prices
 
+def get_volume_prices(sess: BotoSession, region_name: str) -> Dict[str, float]:
+    prices = dict(FALLBACK_VOLUME_PRICES)
+    try:
+        location = AWS_LOCATION_NAME.get(region_name)
+        if not location:
+            return prices
+        pricing = sess.client("pricing", region_name="us-east-1")
+        for volume_type in list(prices.keys()):
+            p = _pricing_lookup_volume(pricing, location, volume_type)
+            if p is not None:
+                prices[volume_type] = p
+    except Exception:
+        pass
+    return prices
 # --------------------- COLLECTION ---------------------
 
 def collect_old_snapshots_for_session(
@@ -646,13 +693,20 @@ def collect_orphan_volumes_for_session(
     account_id: str,
     regions: List[str],
     cfg: BotoConfig,
+    estimate_cost: bool = False,
 ) -> List[Dict[str, Any]]:
     ensure_boto3_imported()
     rows: List[Dict[str, Any]] = []
+    regional_prices_cache: Dict[str, Dict[str, float]] = {}
 
     for region in regions:
         try:
             ec2 = sess.client("ec2", region_name=region, config=cfg)
+            prices = None
+            if estimate_cost:
+                if region not in regional_prices_cache:
+                    regional_prices_cache[region] = get_volume_prices(sess, region)
+                prices = regional_prices_cache[region]
             for vol in paginate_orphan_volumes(ec2):
                 create_time = vol.get("CreateTime")
                 if isinstance(create_time, datetime):
@@ -661,14 +715,25 @@ def collect_orphan_volumes_for_session(
                 else:
                     create_time_str = ""
                     age_days = ""
+                size_gib = int(vol.get("Size", 0) or 0)
+                volume_type = vol.get("VolumeType", "")
+
+                est_monthly_usd = ""
+                price_used = ""
+                if estimate_cost:
+                    price_used = round(
+                        prices.get(volume_type, FALLBACK_VOLUME_PRICES.get(volume_type, FALLBACK_VOLUME_PRICES["gp2"])),
+                        5,
+                    )
+                    est_monthly_usd = round(size_gib * price_used, 2)
 
                 rows.append({
                     "AccountId": account_id,
                     "Region": region,
                     "VolumeId": vol.get("VolumeId", ""),
                     "State": vol.get("State", ""),
-                    "SizeGiB": int(vol.get("Size", 0) or 0),
-                    "VolumeType": vol.get("VolumeType", ""),
+                    "SizeGiB": size_gib,
+                    "VolumeType": volume_type,
                     "Iops": vol.get("Iops", ""),
                     "Throughput": vol.get("Throughput", ""),
                     "Encrypted": vol.get("Encrypted", False),
@@ -677,6 +742,8 @@ def collect_orphan_volumes_for_session(
                     "CreateTime": create_time_str,
                     "AgeDays": age_days,
                     "Tags": ";".join([f"{t.get('Key')}={t.get('Value')}" for t in (vol.get("Tags") or [])]),
+                    "PriceUSDperGBMo": price_used,
+                    "EstMonthlyUSD": est_monthly_usd,
                 })
         except EndpointConnectionError:
             print(f"[skip] {account_id}: region not reachable: {region}", file=sys.stderr)
@@ -894,7 +961,9 @@ def main():
     all_rows: List[Dict[str, Any]] = []
     all_orphan_rows: List[Dict[str, Any]] = []
     summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(lambda: {"count": 0, "total_gib": 0.0, "est_usd": 0.0})
-    orphan_summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(lambda: {"count": 0, "total_gib": 0.0})
+    orphan_summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(
+        lambda: {"count": 0, "total_gib": 0.0, "est_usd": 0.0}
+    )
 
     max_workers = args.max_workers
     if max_workers is not None and max_workers < 1:
@@ -908,7 +977,7 @@ def main():
             lambda: {"count": 0, "total_gib": 0.0, "est_usd": 0.0}
         )
         local_orphan_summary: Dict[Tuple[str, str], Dict[str, float]] = defaultdict(
-            lambda: {"count": 0, "total_gib": 0.0}
+            lambda: {"count": 0, "total_gib": 0.0, "est_usd": 0.0}
         )
 
         # Determine session by mode
@@ -967,6 +1036,7 @@ def main():
                 acct,
                 regions,
                 cfg,
+                estimate_cost=args.estimate_cost,
             )
 
         for r in rows:
@@ -987,6 +1057,11 @@ def main():
             local_orphan_summary[key]["count"] += 1
             try:
                 local_orphan_summary[key]["total_gib"] += float(r.get("SizeGiB") or 0.0)
+            except Exception:
+                pass
+            try:
+                if args.estimate_cost and r.get("EstMonthlyUSD") not in ("", None):
+                    local_orphan_summary[key]["est_usd"] += float(r.get("EstMonthlyUSD") or 0.0)
             except Exception:
                 pass
 
@@ -1027,6 +1102,11 @@ def main():
                     orphan_summary[key]["total_gib"] += float(data.get("total_gib") or 0.0)
                 except Exception:
                     pass
+                try:
+                    if args.estimate_cost and data.get("est_usd") not in ("", None):
+                        orphan_summary[key]["est_usd"] += float(data.get("est_usd") or 0.0)
+                except Exception:
+                    pass
 
     if not all_rows and not all_orphan_rows:
         print(f"No snapshots older than {args.days} days were found across {len(target_accounts)} account(s).")
@@ -1051,12 +1131,21 @@ def main():
 
         if args.orphan_volumes:
             print("\n=== ORPHANED EBS VOLUMES SUMMARY ===")
-            orphan_total = 0; orphan_gib = 0.0
+            orphan_total = 0; orphan_gib = 0.0; orphan_usd = 0.0
             for (acct, region) in sorted(orphan_summary.keys()):
                 data = orphan_summary[(acct, region)]
-                orphan_total += data["count"]; orphan_gib += data["total_gib"]
-                print(f"  {acct} | {region:>12} | {int(data['count']):>5} vols | {data['total_gib']:.2f} GiB")
-            print(f"\nGlobal total: {int(orphan_total)} vols | {orphan_gib:.2f} GiB")
+                orphan_total += data["count"]; orphan_gib += data["total_gib"]; orphan_usd += data["est_usd"]
+                if args.estimate_cost:
+                    print(
+                        f"  {acct} | {region:>12} | {int(data['count']):>5} vols | "
+                        f"{data['total_gib']:.2f} GiB | ${data['est_usd']:.2f}/mo"
+                    )
+                else:
+                    print(f"  {acct} | {region:>12} | {int(data['count']):>5} vols | {data['total_gib']:.2f} GiB")
+            if args.estimate_cost:
+                print(f"\nGlobal total: {int(orphan_total)} vols | {orphan_gib:.2f} GiB | ${orphan_usd:.2f}/mo")
+            else:
+                print(f"\nGlobal total: {int(orphan_total)} vols | {orphan_gib:.2f} GiB")
 
         if args.csv_path:
             try:
@@ -1078,9 +1167,11 @@ def main():
                 with open(args.orphan_volumes_csv, "w", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
                     hdr = ["AccountId","Region","OrphanVolumeCount","TotalVolumeSizeGiB"]
+                    if args.estimate_cost: hdr.append("EstMonthlyUSD")
                     writer.writerow(hdr)
                     for (acct, region), data in sorted(orphan_summary.items()):
                         row = [acct, region, int(data["count"]), f"{data['total_gib']:.2f}"]
+                        if args.estimate_cost: row.append(f"{data['est_usd']:.2f}")
                         writer.writerow(row)
                 print(f"Wrote orphan volumes summary CSV: {args.orphan_volumes_csv}")
             except OSError as e:
@@ -1123,6 +1214,8 @@ def main():
         if all_orphan_rows:
             header = ["AccountId","Region","VolumeId","State","SizeGiB","VolumeType","Iops","Throughput",
                       "Encrypted","KmsKeyId","SnapshotId","CreateTime","AgeDays","Tags"]
+            if args.estimate_cost:
+                header.extend(["PriceUSDperGBMo", "EstMonthlyUSD"])
             print("\n=== Orphaned EBS Volumes ===")
             print("\t".join(header))
             shown = 0
@@ -1153,6 +1246,8 @@ def main():
     if args.orphan_volumes and args.orphan_volumes_csv and all_orphan_rows:
         fieldnames = ["AccountId","Region","VolumeId","State","SizeGiB","VolumeType","Iops","Throughput",
                       "Encrypted","KmsKeyId","SnapshotId","CreateTime","AgeDays","Tags"]
+        if args.estimate_cost:
+            fieldnames.extend(["PriceUSDperGBMo", "EstMonthlyUSD"])
         try:
             with open(args.orphan_volumes_csv, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fieldnames)
